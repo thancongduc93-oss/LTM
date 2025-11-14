@@ -1,0 +1,713 @@
+#include <mavsdk/mavsdk.h>
+#include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/plugins/action/action.h>
+#include <mavsdk/plugins/mission/mission.h>
+#include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
+
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <memory>
+#include <vector>
+#include <iomanip>
+#include <atomic>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <map>
+#include <sstream>
+#include <fstream>
+
+using namespace mavsdk;
+using namespace std::chrono_literals;
+
+// ==================== CẤU HÌNH HỆ THỐNG ====================
+struct SystemConfig {
+    std::string connection_url = "udp://:14540";
+    int telemetry_rate_hz = 5;
+    int timeout_seconds = 30;
+    float default_altitude = 10.0f;
+    float mission_speed = 5.0f;
+    float low_battery_threshold = 0.2f;
+    int min_satellites = 6;
+};
+
+// ==================== TRẠNG THÁI DRONE ====================
+struct DroneStatus {
+    std::string name;
+    Telemetry::Position position{};
+    Telemetry::VelocityNed velocity{};
+    Telemetry::Health health{};
+    Telemetry::GpsInfo gps_info{};
+    Telemetry::Battery battery{};
+    Telemetry::FlightMode flight_mode{};
+    bool armed = false;
+    bool connected = false;
+    std::chrono::steady_clock::time_point last_update;
+    
+    std::string to_string() const {
+        std::stringstream ss;
+        ss << "Drone: " << name 
+           << " | Pos: " << std::fixed << std::setprecision(6) 
+           << position.latitude_deg << ", " << position.longitude_deg
+           << " | Alt: " << position.relative_altitude_m << "m"
+           << " | Armed: " << (armed ? "YES" : "NO")
+           << " | Battery: " << (battery.remaining_percent * 100) << "%"
+           << " | Sats: " << gps_info.num_satellites;
+        return ss.str();
+    }
+    
+private:
+    std::string flight_mode_to_string(Telemetry::FlightMode mode) const {
+        switch(mode) {
+            case Telemetry::FlightMode::Ready: return "READY";
+            case Telemetry::FlightMode::Takeoff: return "TAKEOFF";
+            case Telemetry::FlightMode::Hold: return "HOLD";
+            case Telemetry::FlightMode::Mission: return "MISSION";
+            case Telemetry::FlightMode::ReturnToLaunch: return "RTL";
+            case Telemetry::FlightMode::Land: return "LAND";
+            case Telemetry::FlightMode::Offboard: return "OFFBOARD";
+            case Telemetry::FlightMode::FollowMe: return "FOLLOW_ME";
+            case Telemetry::FlightMode::Manual: return "MANUAL";
+            case Telemetry::FlightMode::Altctl: return "ALTCTL";
+            case Telemetry::FlightMode::Posctl: return "POSCTL";
+            case Telemetry::FlightMode::Acro: return "ACRO";
+            case Telemetry::FlightMode::Stabilized: return "STABILIZED";
+            default: return "UNKNOWN";
+        }
+    }
+};
+
+// ==================== LỚP QUẢN LÝ DRONE ====================
+class DroneManager {
+private:
+    std::shared_ptr<System> system_;
+    std::shared_ptr<Telemetry> telemetry_;
+    std::shared_ptr<Action> action_;
+    std::shared_ptr<Mission> mission_;
+    
+    std::atomic<bool> monitoring_active_{false};
+    std::atomic<bool> mission_running_{false};
+    std::thread monitor_thread_;
+    std::thread mission_thread_;
+    mutable std::mutex status_mutex_;
+    DroneStatus current_status_;
+    SystemConfig config_;
+    
+public:
+    DroneManager(std::shared_ptr<System> system, const std::string& name, const SystemConfig& config = SystemConfig{})
+        : system_(system), config_(config) {
+        
+        current_status_.name = name;
+        current_status_.last_update = std::chrono::steady_clock::now();
+        initialize_plugins();
+    }
+    
+    ~DroneManager() {
+        stop_monitoring();
+        if (monitor_thread_.joinable()) {
+            monitor_thread_.join();
+        }
+        if (mission_thread_.joinable()) {
+            mission_thread_.join();
+        }
+    }
+    
+private:
+    void initialize_plugins() {
+        try {
+            telemetry_ = std::make_shared<Telemetry>(system_);
+            action_ = std::make_shared<Action>(system_);
+            mission_ = std::make_shared<Mission>(system_);
+            
+            // Cấu hình telemetry rates
+            telemetry_->set_rate_position(5.0);
+            telemetry_->set_rate_velocity_ned(5.0);
+            telemetry_->set_rate_battery(2.0);
+            telemetry_->set_rate_gps_info(2.0);
+            
+            std::cout << "✅ Đã khởi tạo plugins cho " << current_status_.name << std::endl;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khởi tạo plugins: " << e.what() << std::endl;
+        }
+    }
+    
+public:
+    // ==================== GIÁM SÁT ====================
+    void start_monitoring() {
+        if (monitoring_active_) {
+            return;
+        }
+        
+        monitoring_active_ = true;
+        setup_telemetry_callbacks();
+        monitor_thread_ = std::thread(&DroneManager::monitor_loop, this);
+        std::cout << "📊 Bắt đầu giám sát " << current_status_.name << std::endl;
+    }
+    
+    void stop_monitoring() {
+        monitoring_active_ = false;
+    }
+    
+private:
+    void setup_telemetry_callbacks() {
+        // Position callback
+        telemetry_->subscribe_position([this](Telemetry::Position position) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.position = position;
+            current_status_.last_update = std::chrono::steady_clock::now();
+        });
+        
+        // Velocity callback
+        telemetry_->subscribe_velocity_ned([this](Telemetry::VelocityNed velocity) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.velocity = velocity;
+        });
+        
+        // Battery callback
+        telemetry_->subscribe_battery([this](Telemetry::Battery battery) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.battery = battery;
+            
+            // Cảnh báo pin thấp
+            if (battery.remaining_percent < config_.low_battery_threshold) {
+                std::cout << "⚠️  CẢNH BÁO PIN THẤP: " << current_status_.name 
+                          << " - " << (battery.remaining_percent * 100) << "%" << std::endl;
+            }
+        });
+        
+        // GPS info callback
+        telemetry_->subscribe_gps_info([this](Telemetry::GpsInfo gps_info) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.gps_info = gps_info;
+            
+            // Cảnh báo ít vệ tinh
+            if (gps_info.num_satellites < config_.min_satellites) {
+                std::cout << "⚠️  CẢNH BÁO ÍT VỆ TINH: " << current_status_.name 
+                          << " - " << gps_info.num_satellites << " satellites" << std::endl;
+            }
+        });
+        
+        // Armed status callback
+        telemetry_->subscribe_armed([this](bool armed) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.armed = armed;
+            std::cout << "🚨 " << current_status_.name << " - " 
+                      << (armed ? "ARMED ✅" : "DISARMED ❌") << std::endl;
+        });
+        
+        // Flight mode callback
+        telemetry_->subscribe_flight_mode([this](Telemetry::FlightMode mode) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.flight_mode = mode;
+        });
+        
+        // Health callback
+        telemetry_->subscribe_health([this](Telemetry::Health health) {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_status_.health = health;
+        });
+    }
+    
+    void monitor_loop() {
+        while (monitoring_active_) {
+            try {
+                update_status_display();
+                check_system_health();
+                std::this_thread::sleep_for(1s);
+                
+            } catch (const std::exception& e) {
+                std::cerr << "❌ Lỗi trong monitor loop: " << e.what() << std::endl;
+                std::this_thread::sleep_for(2s);
+            }
+        }
+    }
+    
+    void update_status_display() {
+        DroneStatus status_copy;
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            status_copy = current_status_;
+        }
+        
+        std::cout << "\n┌────────────────────────────────────────────────────────────┐\n";
+        std::cout << "│ " << std::left << std::setw(58) << status_copy.name + " - DRONE STATUS" << "│\n";
+        std::cout << "├────────────────────────────────────────────────────────────┤\n";
+        
+        std::cout << "│ 📍 Position: " << std::fixed << std::setprecision(6) 
+                  << "Lat: " << std::setw(10) << status_copy.position.latitude_deg
+                  << " Lon: " << std::setw(10) << status_copy.position.longitude_deg << "     │\n";
+        
+        std::cout << "│ 📏 Altitude: " << std::setw(6) << status_copy.position.relative_altitude_m << " m"
+                  << " | Speed: " << std::setw(5) << calculate_speed(status_copy) << " m/s"
+                  << "       │\n";
+        
+        std::cout << "│ 🔋 Battery: " << std::setw(5) << std::setprecision(1) 
+                  << (status_copy.battery.remaining_percent * 100) << "%"
+                  << " | Voltage: " << std::setw(4) << status_copy.battery.voltage_v << " V"
+                  << "       │\n";
+        
+        std::cout << "│ 🛰️  GPS: " << std::setw(2) << status_copy.gps_info.num_satellites << " satellites"
+                  << " | Fix: " << std::setw(8) << fix_type_to_string(status_copy.gps_info.fix_type)
+                  << " | Armed: " << std::setw(3) << (status_copy.armed ? "YES" : "NO") << " │\n";
+        
+        std::cout << "│ 🚀 Mode: " << std::setw(12) << flight_mode_to_string(status_copy.flight_mode)
+                  << " | Health: " << std::setw(4) << (is_healthy(status_copy) ? "GOOD" : "BAD") 
+                  << "                         │\n";
+        
+        std::cout << "└────────────────────────────────────────────────────────────┘\n";
+    }
+    
+    float calculate_speed(const DroneStatus& status) const {
+        return std::sqrt(
+            status.velocity.north_m_s * status.velocity.north_m_s +
+            status.velocity.east_m_s * status.velocity.east_m_s +
+            status.velocity.down_m_s * status.velocity.down_m_s
+        );
+    }
+    
+    bool is_healthy(const DroneStatus& status) const {
+        return status.health.is_gyrometer_calibration_ok &&
+               status.health.is_accelerometer_calibration_ok &&
+               status.health.is_magnetometer_calibration_ok &&
+               status.health.is_local_position_ok &&
+               status.health.is_global_position_ok &&
+               status.health.is_home_position_ok;
+    }
+    
+    std::string fix_type_to_string(Telemetry::FixType fix_type) const {
+        switch(fix_type) {
+            case Telemetry::FixType::NoGps: return "No GPS";
+            case Telemetry::FixType::NoFix: return "No Fix";
+            case Telemetry::FixType::Fix2D: return "2D Fix";
+            case Telemetry::FixType::Fix3D: return "3D Fix";
+            case Telemetry::FixType::FixDgps: return "DGPS Fix";
+            case Telemetry::FixType::RtkFloat: return "RTK Float";
+            case Telemetry::FixType::RtkFixed: return "RTK Fixed";
+            default: return "Unknown";
+        }
+    }
+    
+    std::string flight_mode_to_string(Telemetry::FlightMode mode) const {
+        switch(mode) {
+            case Telemetry::FlightMode::Mission: return "MISSION";
+            case Telemetry::FlightMode::ReturnToLaunch: return "RTL";
+            case Telemetry::FlightMode::Land: return "LAND";
+            case Telemetry::FlightMode::Takeoff: return "TAKEOFF";
+            case Telemetry::FlightMode::Hold: return "HOLD";
+            case Telemetry::FlightMode::Offboard: return "OFFBOARD";
+            default: return "OTHER";
+        }
+    }
+    
+    void check_system_health() {
+        auto now = std::chrono::steady_clock::now();
+        auto time_since_update = std::chrono::duration_cast<std::chrono::seconds>(
+            now - current_status_.last_update);
+            
+        if (time_since_update > 10s) {
+            std::cout << "⚠️  CẢNH BÁO: Không nhận được dữ liệu telemetry từ " 
+                      << time_since_update.count() << " giây" << std::endl;
+        }
+    }
+
+public:
+    // ==================== ĐIỀU KHIỂN ====================
+    bool arm() {
+        try {
+            std::cout << "🔓 Đang ARM " << current_status_.name << "..." << std::endl;
+            Action::Result result = action_->arm();
+            
+            if (result == Action::Result::Success) {
+                std::cout << "✅ ARM thành công!" << std::endl;
+                return true;
+            } else {
+                std::cerr << "❌ Lỗi ARM: " << static_cast<int>(result) << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khi ARM: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    bool disarm() {
+        try {
+            std::cout << "🔒 Đang DISARM " << current_status_.name << "..." << std::endl;
+            Action::Result result = action_->disarm();
+            
+            if (result == Action::Result::Success) {
+                std::cout << "✅ DISARM thành công!" << std::endl;
+                return true;
+            } else {
+                std::cerr << "❌ Lỗi DISARM: " << static_cast<int>(result) << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khi DISARM: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    bool takeoff(float altitude_m = 10.0f) {
+        try {
+            std::cout << "🚀 " << current_status_.name << " cất cánh lên " << altitude_m << "m..." << std::endl;
+            Action::Result result = action_->takeoff();
+            
+            if (result == Action::Result::Success) {
+                std::cout << "✅ Lệnh cất cánh thành công!" << std::endl;
+                
+                // Chờ đạt độ cao mong muốn
+                std::cout << "⏳ Đang chờ đạt độ cao " << altitude_m << "m..." << std::endl;
+                for (int i = 0; i < 20; ++i) {
+                    std::this_thread::sleep_for(1s);
+                    auto pos = telemetry_->position();
+                    if (pos.relative_altitude_m >= altitude_m * 0.9f) {
+                        std::cout << "✅ Đã đạt độ cao " << pos.relative_altitude_m << "m" << std::endl;
+                        return true;
+                    }
+                }
+                std::cout << "⚠️  Chưa đạt độ cao mong muốn sau 20s" << std::endl;
+                return true;
+            } else {
+                std::cerr << "❌ Lỗi cất cánh: " << static_cast<int>(result) << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khi cất cánh: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    bool land() {
+        try {
+            std::cout << "🛬 " << current_status_.name << " đang hạ cánh..." << std::endl;
+            Action::Result result = action_->land();
+            
+            if (result == Action::Result::Success) {
+                std::cout << "✅ Lệnh hạ cánh thành công!" << std::endl;
+                return true;
+            } else {
+                std::cerr << "❌ Lỗi hạ cánh: " << static_cast<int>(result) << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khi hạ cánh: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    bool return_to_launch() {
+        try {
+            std::cout << "🏠 " << current_status_.name << " đang trở về điểm xuất phát..." << std::endl;
+            Action::Result result = action_->return_to_launch();
+            
+            if (result == Action::Result::Success) {
+                std::cout << "✅ Lệnh RTL thành công!" << std::endl;
+                return true;
+            } else {
+                std::cerr << "❌ Lỗi RTL: " << static_cast<int>(result) << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi khi RTL: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+    // ==================== MISSION ====================
+    bool execute_square_mission(float edge_length = 20.0f, float altitude = 15.0f) {
+        if (mission_running_) {
+            std::cerr << "❌ Mission đang chạy, không thể start mission mới" << std::endl;
+            return false;
+        }
+        
+        mission_running_ = true;
+        mission_thread_ = std::thread(&DroneManager::square_mission_worker, this, edge_length, altitude);
+        return true;
+    }
+    
+private:
+    void square_mission_worker(float edge_length, float altitude) {
+        try {
+            std::cout << "🎯 Bắt đầu mission hình vuông - Cạnh: " << edge_length << "m, Độ cao: " << altitude << "m" << std::endl;
+            
+            // Kiểm tra GPS
+            if (!wait_for_gps_fix()) {
+                std::cerr << "❌ Không thể có GPS fix" << std::endl;
+                mission_running_ = false;
+                return;
+            }
+            
+            // ARM và takeoff
+            if (!arm() || !takeoff(altitude)) {
+                mission_running_ = false;
+                return;
+            }
+            
+            std::this_thread::sleep_for(3s);
+            
+            // Lấy vị trí hiện tại
+            auto start_pos = telemetry_->position();
+            const double lat0 = start_pos.latitude_deg;
+            const double lon0 = start_pos.longitude_deg;
+            
+            // Tính toán 4 điểm hình vuông
+            const double meters_to_degrees = 1.0 / 111320.0;
+            std::vector<std::pair<double, double>> waypoints = {
+                {lat0 + edge_length * meters_to_degrees, lon0}, // Đông
+                {lat0 + edge_length * meters_to_degrees, lon0 + edge_length * meters_to_degrees}, // Đông Nam
+                {lat0, lon0 + edge_length * meters_to_degrees}, // Nam  
+                {lat0, lon0} // Về start
+            };
+            
+            // Bay đến các waypoint
+            for (size_t i = 0; i < waypoints.size() && mission_running_; ++i) {
+                std::cout << "📍 Điểm " << (i+1) << "/4: " 
+                          << std::fixed << std::setprecision(6) 
+                          << waypoints[i].first << ", " << waypoints[i].second << std::endl;
+                
+                Action::Result result = action_->goto_location(
+                    waypoints[i].first, waypoints[i].second, altitude, 0.0f
+                );
+                
+                if (result != Action::Result::Success) {
+                    std::cerr << "❌ Lỗi bay đến waypoint " << (i+1) << std::endl;
+                    break;
+                }
+                
+                // Chờ đến waypoint
+                std::this_thread::sleep_for(12s);
+                
+                // Kiểm tra pin
+                auto battery = telemetry_->battery();
+                if (battery.remaining_percent < config_.low_battery_threshold) {
+                    std::cout << "⚠️  Pin thấp, kết thúc mission sớm" << std::endl;
+                    break;
+                }
+            }
+            
+            // Hạ cánh
+            if (mission_running_) {
+                land();
+                std::this_thread::sleep_for(5s);
+                disarm();
+            }
+            
+            std::cout << "✅ Mission hoàn thành!" << std::endl;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi trong mission: " << e.what() << std::endl;
+        }
+        
+        mission_running_ = false;
+    }
+    
+    bool wait_for_gps_fix(int timeout_seconds = 30) {
+        std::cout << "📡 Đang chờ GPS fix..." << std::endl;
+        
+        for (int i = 0; i < timeout_seconds; ++i) {
+            auto gps_info = telemetry_->gps_info();
+            
+            if (gps_info.fix_type >= Telemetry::FixType::Fix3D && 
+                gps_info.num_satellites >= config_.min_satellites) {
+                std::cout << "✅ GPS ready - " << gps_info.num_satellites 
+                          << " satellites, " << fix_type_to_string(gps_info.fix_type) << std::endl;
+                return true;
+            }
+            
+            if (i % 5 == 0) {
+                std::cout << "⏳ Đang chờ GPS... " << i << "/" << timeout_seconds 
+                          << "s - Sats: " << gps_info.num_satellites 
+                          << ", Fix: " << fix_type_to_string(gps_info.fix_type) << std::endl;
+            }
+            
+            std::this_thread::sleep_for(1s);
+        }
+        
+        return false;
+    }
+
+public:
+    // ==================== GETTERS ====================
+    DroneStatus get_status() const {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        return current_status_;
+    }
+    
+    bool is_mission_running() const {
+        return mission_running_;
+    }
+    
+    bool is_monitoring() const {
+        return monitoring_active_;
+    }
+};
+
+// ==================== LỚP QUẢN LÝ FLEET ====================
+class DroneFleetManager {
+private:
+    std::vector<std::unique_ptr<DroneManager>> drones_;
+    mutable std::mutex fleet_mutex_;
+    SystemConfig config_;
+    
+public:
+    bool add_drone(std::shared_ptr<System> system, const std::string& name) {
+        std::lock_guard<std::mutex> lock(fleet_mutex_);
+        
+        try {
+            auto drone = std::make_unique<DroneManager>(system, name, config_);
+            drone->start_monitoring();
+            drones_.push_back(std::move(drone));
+            
+            std::cout << "✅ Đã thêm drone: " << name << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "❌ Lỗi thêm drone " << name << ": " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    void start_all_monitoring() {
+        std::lock_guard<std::mutex> lock(fleet_mutex_);
+        for (auto& drone : drones_) {
+            drone->start_monitoring();
+        }
+    }
+    
+    void stop_all_monitoring() {
+        std::lock_guard<std::mutex> lock(fleet_mutex_);
+        for (auto& drone : drones_) {
+            drone->stop_monitoring();
+        }
+    }
+    
+    size_t get_drone_count() const {
+        std::lock_guard<std::mutex> lock(fleet_mutex_);
+        return drones_.size();
+    }
+    
+    void display_fleet_status() {
+        std::lock_guard<std::mutex> lock(fleet_mutex_);
+        
+        std::cout << "\n🛩️  ==== FLEET STATUS ====" << std::endl;
+        std::cout << "Số lượng drone: " << drones_.size() << std::endl;
+        
+        for (size_t i = 0; i < drones_.size(); ++i) {
+            auto status = drones_[i]->get_status();
+            std::cout << i+1 << ". " << status.to_string() << std::endl;
+        }
+        std::cout << "========================\n" << std::endl;
+    }
+};
+
+// ==================== HÀM MAIN ĐƠN GIẢN ====================
+int main() {
+    std::cout << "🚀 KHỞI ĐỘNG HỆ THỐNG ĐIỀU KHIỂN DRONE" << std::endl;
+    std::cout << "📡 Kết nối tới PX4 SITL qua UDP..." << std::endl;
+    
+    Mavsdk mavsdk;
+    
+    // Kết nối tới PX4 SITL
+    std::cout << "🔗 Đang kết nối tới udp://:14540..." << std::endl;
+    ConnectionResult conn_result = mavsdk.add_any_connection("udp://:14540");
+    
+    if (conn_result != ConnectionResult::Success) {
+        std::cerr << "❌ Lỗi kết nối: " << static_cast<int>(conn_result) << std::endl;
+        return 1;
+    }
+    
+    std::cout << "✅ Kết nối thành công! Đang chờ drone..." << std::endl;
+    
+    // Chờ drone kết nối
+    auto start_time = std::chrono::steady_clock::now();
+    while (mavsdk.systems().empty()) {
+        if (std::chrono::steady_clock::now() - start_time > 30s) {
+            std::cerr << "❌ Timeout: Không có drone nào kết nối sau 30s" << std::endl;
+            return 1;
+        }
+        std::cout << "⏳ Đang chờ drone..." << std::endl;
+        std::this_thread::sleep_for(2s);
+    }
+    
+    // Tạo drone manager
+    auto drone_system = mavsdk.systems().at(0);
+    DroneManager drone(drone_system, "DRONE_01");
+    drone.start_monitoring();
+    
+    std::cout << "✅ Hệ thống đã sẵn sàng!" << std::endl;
+    
+    // Menu điều khiển đơn giản
+    int choice = 0;
+    while (choice != 9) {
+        std::cout << "\n🎮 ==== MENU ĐIỀU KHIỂN ====" << std::endl;
+        std::cout << "1. ARM drone" << std::endl;
+        std::cout << "2. DISARM drone" << std::endl;
+        std::cout << "3. Cất cánh" << std::endl;
+        std::cout << "4. Hạ cánh" << std::endl;
+        std::cout << "5. Bay mission hình vuông" << std::endl;
+        std::cout << "6. Return to Launch" << std::endl;
+        std::cout << "7. Emergency Stop" << std::endl;
+        std::cout << "8. Hiển thị trạng thái" << std::endl;
+        std::cout << "9. Thoát" << std::endl;
+        std::cout << "Chọn: ";
+        
+        std::cin >> choice;
+        
+        switch (choice) {
+            case 1:
+                drone.arm();
+                break;
+                
+            case 2:
+                drone.disarm();
+                break;
+                
+            case 3:
+                drone.takeoff(12.0f);
+                break;
+                
+            case 4:
+                drone.land();
+                break;
+                
+            case 5:
+                drone.execute_square_mission(15.0f, 12.0f);
+                std::cout << "⏳ Mission đang chạy..." << std::endl;
+                break;
+                
+            case 6:
+                drone.return_to_launch();
+                break;
+                
+            case 7:
+                std::cout << "🛑 EMERGENCY STOP - Hạ cánh khẩn cấp!" << std::endl;
+                drone.land();
+                drone.disarm();
+                break;
+                
+            case 8:
+                // Status được hiển thị tự động qua monitoring
+                break;
+                
+            case 9:
+                std::cout << "👋 Kết thúc chương trình..." << std::endl;
+                break;
+                
+            default:
+                std::cout << "❌ Lựa chọn không hợp lệ!" << std::endl;
+                break;
+        }
+        
+        if (choice != 9) {
+            std::this_thread::sleep_for(2s);
+        }
+    }
+    
+    drone.stop_monitoring();
+    std::cout << "✅ Hệ thống đã dừng an toàn!" << std::endl;
+    
+    return 0;
+}
