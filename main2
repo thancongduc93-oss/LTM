@@ -1,0 +1,298 @@
+#include <mavsdk/mavsdk.h>
+#include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/plugins/action/action.h>
+
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <cmath>
+#include <atomic>
+#include <mutex>
+#include <iomanip>
+#include <termios.h>
+#include <unistd.h>
+#include <vector>
+
+using namespace mavsdk;
+using namespace std::chrono_literals;
+
+// ==================== HÀM NHẬN PHÍM KHÔNG BLOCK ====================
+void setNonBlocking(bool enable) {
+    struct termios ttystate;
+    tcgetattr(STDIN_FILENO, &ttystate);
+
+    if (enable) {
+        ttystate.c_lflag &= ~ICANON; // Tắt canonical mode
+        ttystate.c_lflag &= ~ECHO;   // Tắt echo
+        ttystate.c_cc[VMIN] = 0;
+        ttystate.c_cc[VTIME] = 0;
+    } else {
+        ttystate.c_lflag |= ICANON;
+        ttystate.c_lflag |= ECHO;
+    }
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &ttystate);
+}
+
+int kbhit() {
+    struct timeval tv = {0L, 0L};
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO+1, &fds, NULL, NULL, &tv);
+}
+
+char getch() {
+    char c;
+    if (read(STDIN_FILENO, &c, 1) < 0) return 0;
+    return c;
+}
+
+// ==================== DRONE MANAGER ====================
+class DroneManager {
+private:
+    std::shared_ptr<System> system_;
+    std::shared_ptr<Telemetry> telemetry_;
+    std::shared_ptr<Action> action_;
+    std::atomic<bool> monitoring_{false};
+    std::atomic<bool> mission_running_{false};
+    std::atomic<bool> manual_mode_{false};
+    std::thread monitor_thread_;
+    std::thread mission_thread_;
+    std::mutex status_mutex_;
+
+    Telemetry::Position current_pos_;
+    Telemetry::VelocityNed current_vel_;
+    Telemetry::Battery current_battery_;
+
+public:
+    DroneManager(std::shared_ptr<System> system)
+        : system_(system) 
+    {
+        telemetry_ = std::make_shared<Telemetry>(system_);
+        action_ = std::make_shared<Action>(system_);
+    }
+
+    void start_monitoring() {
+        monitoring_ = true;
+        telemetry_->subscribe_position([this](Telemetry::Position pos){
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_pos_ = pos;
+        });
+        telemetry_->subscribe_velocity_ned([this](Telemetry::VelocityNed vel){
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_vel_ = vel;
+        });
+        telemetry_->subscribe_battery([this](Telemetry::Battery bat){
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            current_battery_ = bat;
+        });
+
+        monitor_thread_ = std::thread([this](){
+            while (monitoring_) {
+                Telemetry::Position pos;
+                Telemetry::VelocityNed vel;
+                Telemetry::Battery bat;
+                {
+                    std::lock_guard<std::mutex> lock(status_mutex_);
+                    pos = current_pos_;
+                    vel = current_vel_;
+                    bat = current_battery_;
+                }
+                float speed = std::sqrt(vel.north_m_s*vel.north_m_s +
+                                        vel.east_m_s*vel.east_m_s +
+                                        vel.down_m_s*vel.down_m_s);
+
+                std::cout << "\rLat: " << pos.latitude_deg
+                          << " Lon: " << pos.longitude_deg
+                          << " Alt: " << pos.relative_altitude_m
+                          << " Speed: " << speed
+                          << " m/s"
+                          << " Bat: " << bat.remaining_percent*100 << "%     "
+                          << std::flush;
+
+                std::this_thread::sleep_for(200ms);
+            }
+        });
+    }
+
+    void stop_monitoring() {
+        monitoring_ = false;
+        if (monitor_thread_.joinable()) monitor_thread_.join();
+    }
+
+    bool arm() {
+        auto res = action_->arm();
+        if (res == Action::Result::Success) {
+            std::cout << "\n✅ Drone ARMED\n";
+            return true;
+        }
+        std::cout << "\n❌ ARM failed\n";
+        return false;
+    }
+
+    bool disarm() {
+        auto res = action_->disarm();
+        if (res == Action::Result::Success) {
+            std::cout << "\n✅ Drone DISARMED\n";
+            return true;
+        }
+        std::cout << "\n❌ DISARM failed\n";
+        return false;
+    }
+
+    bool takeoff(float alt=10.0f) {
+        auto res = action_->takeoff();
+        if (res != Action::Result::Success) {
+            std::cout << "\n❌ Takeoff failed\n";
+            return false;
+        }
+        std::this_thread::sleep_for(5s); // đợi cất cánh
+        std::cout << "\n✅ Drone TAKEOFF\n";
+        return true;
+    }
+
+    bool land() {
+        auto res = action_->land();
+        if (res != Action::Result::Success) {
+            std::cout << "\n❌ Land failed\n";
+            return false;
+        }
+        std::this_thread::sleep_for(5s);
+        std::cout << "\n✅ Drone LANDED\n";
+        return true;
+    }
+
+    // ==================== MISSION ====================
+    void start_circle_mission(float radius=10.0f, float alt=10.0f, float speed=1.0f) {
+        if (mission_running_) return;
+        mission_running_ = true;
+
+        mission_thread_ = std::thread([this, radius, alt, speed](){
+            Telemetry::Position start_pos = telemetry_->position();
+            double lat0 = start_pos.latitude_deg;
+            double lon0 = start_pos.longitude_deg;
+            const double meters_to_degrees = 1.0 / 111320.0;
+
+            float angle = 0.0f;
+            float dt = 0.2f;
+
+            while (mission_running_) {
+                double lat = lat0 + radius * cos(angle) * meters_to_degrees;
+                double lon = lon0 + radius * sin(angle) * meters_to_degrees;
+                action_->goto_location(lat, lon, alt, 0.0f);
+
+                angle += (speed / radius) * dt;
+                if (angle > 2*M_PI) angle -= 2*M_PI;
+                std::this_thread::sleep_for(std::chrono::milliseconds(int(dt*1000)));
+            }
+        });
+    }
+
+    void start_square_mission(float edge=10.0f, float alt=10.0f, float speed=2.0f) {
+        if (mission_running_) return;
+        mission_running_ = true;
+
+        mission_thread_ = std::thread([this, edge, alt, speed](){
+            Telemetry::Position start_pos = telemetry_->position();
+            double lat0 = start_pos.latitude_deg;
+            double lon0 = start_pos.longitude_deg;
+            const double meters_to_degrees = 1.0 / 111320.0;
+
+            std::vector<std::pair<double,double>> points = {
+                {lat0 + edge*meters_to_degrees, lon0},
+                {lat0 + edge*meters_to_degrees, lon0 + edge*meters_to_degrees},
+                {lat0, lon0 + edge*meters_to_degrees},
+                {lat0, lon0}
+            };
+
+            size_t i = 0;
+            while (mission_running_) {
+                double lat = points[i].first;
+                double lon = points[i].second;
+                action_->goto_location(lat, lon, alt, 0.0f);
+
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                i = (i+1)%points.size();
+            }
+        });
+    }
+
+    void stop_mission() {
+        mission_running_ = false;
+        if (mission_thread_.joinable()) mission_thread_.join();
+    }
+
+    // ==================== MANUAL CONTROL ====================
+    void manual_control(float step_m=2.0f) {
+        manual_mode_ = true;
+        Telemetry::Position start_pos = telemetry_->position();
+        double lat = start_pos.latitude_deg;
+        double lon = start_pos.longitude_deg;
+        double alt = start_pos.relative_altitude_m;
+
+        while (manual_mode_) {
+            if (kbhit()) {
+                char c = getch();
+                const double meters_to_degrees = 1.0 / 111320.0;
+                switch(c) {
+                    case 'w': lat += step_m * meters_to_degrees; break;
+                    case 's': lat -= step_m * meters_to_degrees; break;
+                    case 'a': lon -= step_m * meters_to_degrees; break;
+                    case 'd': lon += step_m * meters_to_degrees; break;
+                    case 'r': alt += step_m; break;
+                    case 'f': alt -= step_m; break;
+                    case 'q': manual_mode_ = false; break;
+                }
+                action_->goto_location(lat, lon, alt, 0.0f);
+            }
+            std::this_thread::sleep_for(50ms);
+        }
+    }
+};
+
+// ==================== MAIN ====================
+int main() {
+    Mavsdk::Configuration config(245, 0, true);  
+    Mavsdk mavsdk(config);
+    ConnectionResult conn_result = mavsdk.add_any_connection("udp://:14540");
+    if (conn_result != ConnectionResult::Success) {
+        std::cerr << "Connection failed\n";
+        return 1;
+    }
+
+    while (mavsdk.systems().empty()) std::this_thread::sleep_for(1s);
+    auto system = mavsdk.systems().at(0);
+
+    DroneManager drone(system);
+    drone.start_monitoring();
+
+    setNonBlocking(true);
+    bool running = true;
+
+    std::cout << "\nWASD: di chuyển, RF: cao/thấp, C: circle, S: square, M: manual, L: land, T: takeoff, X: stop mission, Q: quit\n";
+
+    while (running) {
+        if (kbhit()) {
+            char c = getch();
+            switch(c) {
+                case 't': drone.arm(); drone.takeoff(10.0f); break;
+                case 'l': drone.land(); drone.disarm(); break;
+                case 'c': drone.stop_mission(); drone.start_circle_mission(10.0f, 10.0f, 1.0f); break;
+                case 's': drone.stop_mission(); drone.start_square_mission(10.0f, 10.0f, 2.0f); break;
+                case 'm': drone.stop_mission(); drone.manual_control(); break;
+                case 'x': drone.stop_mission(); break;
+                case 'q': running=false; break;
+            }
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+
+    drone.stop_mission();
+    drone.land();
+    drone.disarm();
+    drone.stop_monitoring();
+    setNonBlocking(false);
+
+    return 0;
+}
