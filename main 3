@@ -251,7 +251,7 @@ public:
                 double lon = points[i].second;
                 action_->goto_location(lat, lon, alt, 0.0f);
 
-                std::this_thread::sleep_for(200ms);
+                std::this_thread::sleep_for(std::chrono::seconds(5));
                 i = (i+1)%points.size();
             }
         });
@@ -283,7 +283,7 @@ public:
                 double lon = points[i].second;
                 action_->goto_location(lat, lon, alt, 0.0f);
 
-                std::this_thread::sleep_for(200ms);
+                std::this_thread::sleep_for(std::chrono::seconds(5));
                 i = (i+1)%points.size();
             }
         });
