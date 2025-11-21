@@ -184,68 +184,74 @@ public:
     }
 
     bool takeoff(float alt=10.0f) {
-        // Ensure we have a position fix before attempting takeoff
-        if (!wait_for_position(10)) {
-            std::cout << "\nTakeoff aborted: no position fix\n";
-            return false;
-        }
+    if (!wait_for_position(10)) return false;
+    
+    if (action_->takeoff() != Action::Result::Success) return false;
 
-        auto res = action_->takeoff();
-        if (res != Action::Result::Success) {
-            std::cout << "\n Takeoff failed: "  << "\n";
-            return false;
-        }
-        std::this_thread::sleep_for(5s);
-        std::cout << "\n Drone TAKEOFF\n";
-        return true;
+    // Wait until drone is in air
+    int waited_ms = 0;
+    while (!telemetry_->in_air() && waited_ms < 10000) { // timeout 10s
+        std::this_thread::sleep_for(200ms);
+        waited_ms += 200;
     }
+
+    if (!telemetry_->in_air()) {
+        std::cout << "Takeoff failed: drone not in air\n";
+        return false;
+    }
+    std::cout << "Drone TAKEOFF\n";
+    return true;
+}
 
     bool land() {
-        auto res = action_->land();
-        if (res != Action::Result::Success) {
-            std::cout << "\n Land failed: "  << "\n";
+    if (action_->land() != Action::Result::Success) return false;
+
+    int waited_ms = 0;
+    while (telemetry_->landed_state() != Telemetry::LandedState::OnGround && waited_ms < 60000) {
+        std::this_thread::sleep_for(200ms);
+        waited_ms += 200;
+    }
+
+    if (telemetry_->landed_state() != Telemetry::LandedState::OnGround) {
+        std::cout << "Land timeout!\n";
+        return false;
+    }
+
+    std::cout << "Drone LANDED\n";
+    return true;
+}
+    bool safe_land_and_disarm() {
+        // Gửi lệnh hạ cánh
+        if (action_->land() != Action::Result::Success) {
+        std::cout << "\nLanding command failed!\n";
+        return false;
+        }
+
+        // Chờ thật sự landed
+        const int timeout_sec = 60;
+        int waited = 0;
+        while (telemetry_->landed_state() != Telemetry::LandedState::OnGround && waited < timeout_sec*1000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            waited += 200;
+        }
+
+        if (telemetry_->landed_state() != Telemetry::LandedState::OnGround) {
+            std::cout << "\nTimeout: drone did not land!\n";
             return false;
         }
-        std::this_thread::sleep_for(5s);
-        std::cout << "\n Drone LANDED\n";
-        set_mission_name("None");
+
+        std::cout << "\nDrone LANDED\n";
+
+        // Disarm
+        if (action_->disarm() != Action::Result::Success) {
+            std::cout << "Disarm failed!\n";
+            return false;
+        }
+
+        std::cout << "Drone DISARMED\n";
         return true;
-    }
-bool safe_land_and_disarm() {
-// Gửi lệnh hạ cánh
-if (action_->land() != Action::Result::Success) {
-std::cout << "\nLanding command failed!\n";
-return false;
-}
 
-// Chờ thật sự landed
-const int timeout_sec = 60;
-int waited = 0;
-while (telemetry_->landed_state() != Telemetry::LandedState::OnGround && waited < timeout_sec*1000) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    waited += 200;
-}
-
-if (telemetry_->landed_state() != Telemetry::LandedState::OnGround) {
-    std::cout << "\nTimeout: drone did not land!\n";
-    return false;
-}
-
-std::cout << "\nDrone LANDED\n";
-
-// Disarm
-if (action_->disarm() != Action::Result::Success) {
-    std::cout << "Disarm failed!\n";
-    return false;
-}
-
-std::cout << "Drone DISARMED\n";
-return true;
-
-}
-
-
-
+        }
     // ==================== MISSION ====================
     void stop_mission() {
         manual_mode_ = false; // ensure manual loop exits
