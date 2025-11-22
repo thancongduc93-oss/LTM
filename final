@@ -148,7 +148,7 @@ public:
                     << " Lon:" << std::setw(10) << std::fixed << std::setprecision(6) << pos.longitude_deg << "°"
                     << " Alt:" << std::setw(7)  << std::fixed << std::setprecision(2) << pos.relative_altitude_m << " m"
                     << " | Speed:" << std::setw(6) << std::fixed << std::setprecision(2) << speed << " m/s"
-                    << " | Bat:"   << std::setw(5) << std::fixed << std::setprecision(1) << bat.remaining_percent*100 << "%"
+                    << " | Bat:"   << std::setw(5) << std::fixed << std::setprecision(1) << bat.remaining_percent << "%"
                     << " | Mission:" << std::setw(10) << std::left << mname
                     << std::right << std::flush;
 
@@ -389,42 +389,47 @@ public:
     }
 
     void start_sine_mission(float amplitude=5.0f, float wavelength=10.0f, float alt=10.0f, float speed=1.0f) {
-        if (mission_running_) return;
-        mission_running_ = true;
-        set_mission_name("Sine");
+    if (mission_running_) return;
+    mission_running_ = true;
+    set_mission_name("Sine");
 
-        mission_thread_ = std::thread([this, amplitude, wavelength, alt, speed](){
-            if (!wait_for_position(10)) {
-                std::cout << "\nSine mission aborted: no position fix\n";
-                mission_running_ = false;
-                set_mission_name("None");
-                return;
-            }
+    mission_thread_ = std::thread([this, amplitude, wavelength, alt, speed](){
+        if (!wait_for_position(10)) {
+            std::cout << "\nSine mission aborted: no position fix\n";
+            mission_running_ = false;
+            set_mission_name("None");
+            return;
+        }
 
-            Telemetry::Position start_pos = telemetry_->position();
-            double lat0 = start_pos.latitude_deg;
-            double lon0 = start_pos.longitude_deg;
+        Telemetry::Position start_pos = telemetry_->position();
+        double lat0 = start_pos.latitude_deg;
+        double lon0 = start_pos.longitude_deg;
+
+        double x = 0.0;  // khoảng cách di chuyển theo kinh độ
+        double dt = 1.0; // thời gian 1s giữa các lệnh
+
+        while (mission_running_) {
+            // chuyển đổi từ mét sang độ
             const double meters_to_lat = 1.0 / 111320.0;
             const double meters_to_lon = 1.0 / (111320.0 * std::cos(lat0 * M_PI / 180.0));
 
-            double x = 0.0;
-            double dt = 1.0;
+            // Drone chạy ngang theo kinh độ (trái → phải)
+            double lon = lon0 + x * meters_to_lon;
+            // Sóng sin lên xuống theo vĩ độ
+            double lat = lat0 + amplitude * std::sin(2*M_PI*x / wavelength) * meters_to_lat;
 
-            while (mission_running_) {
-                double lat = lat0 + x * meters_to_lat;
-                double lon = lon0 + amplitude * std::sin(2*M_PI*x/wavelength) * meters_to_lon;
-                auto res = action_->goto_location(lat, lon, alt, 0.0f);
-                if (res != Action::Result::Success) {
-                    std::cout << "\ngoto_location failed: "  << "\n";
-                }
-
-                x += speed * dt;
-                std::this_thread::sleep_for(std::chrono::milliseconds(int(dt*1000)));
+            auto res = action_->goto_location(lat, lon, alt, 0.0f);
+            if (res != Action::Result::Success) {
+                std::cout << "\ngoto_location failed\n";
             }
 
-            set_mission_name("None");
-        });
-    }
+            x += speed * dt; // tăng khoảng cách
+            std::this_thread::sleep_for(std::chrono::milliseconds(int(dt*1000)));
+        }
+
+        set_mission_name("None");
+    });
+}
 
     // ==================== MANUAL CONTROL ====================
     void manual_control(float step_m=2.0f) {
